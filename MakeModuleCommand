@@ -15,12 +15,14 @@ class MakeModule extends Command
     {
         $module = $this->argument('name');
 
-        $this->info($module);
-        $model = $this->option('model') ?? Str::singular($module);
-        $moduleStudly = $module;
-        $modelStudly = $model;
+        $this->info("Création du module: $module");
 
-        $this->info("Création du module: $moduleStudly avec modèle: $modelStudly");
+        $model = $this->option('model') ?? Str::singular($module);
+
+        $moduleStudly = Str::studly($module);
+        $modelStudly = Str::studly($model);
+
+        $this->info("Modèle utilisé: $modelStudly");
 
         $basePath = app_path("Modules/{$moduleStudly}");
         $this->createModuleStructure($basePath);
@@ -35,7 +37,7 @@ class MakeModule extends Command
         $this->info("Module $moduleStudly créé avec succès.");
     }
 
-    protected function generateController($basePath, $model, $moduleStudly): void
+    protected function generateController(string $basePath, string $model, string $moduleStudly): void
     {
         $className = "{$model}Controller";
         $namespace = "App\\Modules\\$moduleStudly\\Controllers";
@@ -96,7 +98,8 @@ class $className extends ApiController
     public function update(Request \$request, \$id): JsonResponse
     {
         try {
-            \$this->service->update(\$id, \$request->all());
+            \$data = \$request->all();
+            \$this->service->update(\$id, \$data);
             return \$this->respondSuccess();
         } catch (\Exception \$e) {
             return \$this->respondError(\$e->getMessage());
@@ -152,7 +155,7 @@ PHP;
         $this->info("Modèle $model déplacé dans le module $module avec namespace mis à jour.");
     }
 
-    protected function generateResource($basePath, $model, $columns, $moduleStudly): void
+    protected function generateResource(string $basePath, string $model, array $columns, string $moduleStudly): void
     {
         $className = "{$model}Resource";
         $namespace = "App\\Modules\\$moduleStudly\\Resources";
@@ -191,17 +194,15 @@ PHP;
 
 
 
-    protected function createModuleStructure($basePath): void
+    protected function createModuleStructure(string $basePath): void
     {
         $folders = ['Controllers', 'Models', 'Services', 'Requests', 'Resources'];
-
-
         foreach ($folders as $folder) {
             File::ensureDirectoryExists("$basePath/$folder");
         }
     }
 
-    protected function extractColumnsFromMigration($model): array
+    protected function extractColumnsFromMigration(string $model): array
     {
         $table = Str::snake(Str::pluralStudly($model));
         $migrationPath = database_path('migrations');
@@ -221,18 +222,22 @@ PHP;
         $fields = array_combine($matches[2], $matches[1]);
 
         // Ignorer les colonnes Laravel de base
-        return collect($fields)->reject(function ($type, $field) {
-            return in_array($field, ['id', 'created_at', 'updated_at']);
-        })->toArray();
+        return collect($fields)->reject(fn($type, $field) => in_array($field, ['id', 'created_at', 'updated_at']))->toArray();
     }
 
-    protected function generateService($basePath, $model, $columns, $moduleStudly): void
+    protected function generateService(string $basePath, string $model, array $columns, string $moduleStudly): void
     {
         $className = "{$model}Service";
-        $namespace = "App\\Modules\\" . $moduleStudly . "\\Services";
-
-        $args = implode(', ' . PHP_EOL . '            ', array_map(fn($c) => "'$c' => \$data['$c']", array_keys($columns)));
+        $namespace = "App\\Modules\\$moduleStudly\\Services";
         $modelResource = $model . 'Resource';
+
+        // Création de tableau avec gestion optionnelle des champs pour update
+        $createArgs = implode(",\n            ", array_map(fn($c) => "'$c' => \$data['$c']", array_keys($columns)));
+
+        // Pour update, on crée un tableau conditionnel afin de ne pas écraser les champs non fournis
+        $updateArgs = implode("\n            ", array_map(function($col) {
+            return "if (isset(\$data['$col'])) { \$updateData['$col'] = \$data['$col']; }";
+        }, array_keys($columns)));
 
         $content = <<<PHP
 <?php
@@ -246,13 +251,13 @@ use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
 
 class $className
 {
-    public function create(array \$data): $model
+    public function create(array \$data): $modelResource
     {
         \$sqlModelCreate = $model::create([
-            $args
+            $createArgs
         ]);
 
-        return new $model(\$sqlModelCreate);
+        return new $modelResource(\$sqlModelCreate);
     }
 
     /**
@@ -265,9 +270,10 @@ class $className
             throw new Exception('error.not_found');
         }
 
-        \$model->update([
-            $args
-        ]);
+        \$updateData = [];
+        $updateArgs
+
+        \$model->update(\$updateData);
 
         return new $modelResource(\$model);
     }
@@ -295,7 +301,7 @@ class $className
      */
     public function findById(\$id): ?$modelResource
     {
-        \$modelSql =  $model::find(\$id);
+        \$modelSql = $model::find(\$id);
         if (! \$modelSql) {
             throw new Exception('error.not_found');
         };

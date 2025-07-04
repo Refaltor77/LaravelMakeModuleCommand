@@ -1,0 +1,309 @@
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Str;
+
+class MakeModule extends Command
+{
+    protected $signature = 'make:module {name} {--model=}';
+    protected $description = 'Crée un module avec son service CRUD à partir du model';
+
+    public function handle(): void
+    {
+        $module = $this->argument('name');
+
+        $this->info($module);
+        $model = $this->option('model') ?? Str::singular($module);
+        $moduleStudly = $module;
+        $modelStudly = $model;
+
+        $this->info("Création du module: $moduleStudly avec modèle: $modelStudly");
+
+        $basePath = app_path("Modules/{$moduleStudly}");
+        $this->createModuleStructure($basePath);
+
+        $columns = $this->extractColumnsFromMigration($modelStudly);
+
+        $this->generateService($basePath, $modelStudly, $columns, $moduleStudly);
+        $this->generateResource($basePath, $modelStudly, $columns, $moduleStudly);
+        $this->generateController($basePath, $modelStudly, $moduleStudly);
+        $this->moveModelToModule($modelStudly, $moduleStudly);
+
+        $this->info("Module $moduleStudly créé avec succès.");
+    }
+
+    protected function generateController($basePath, $model, $moduleStudly): void
+    {
+        $className = "{$model}Controller";
+        $namespace = "App\\Modules\\$moduleStudly\\Controllers";
+        $serviceName = "{$model}Service";
+        $resourceName = "{$model}Resource";
+
+        $content = <<<PHP
+<?php
+
+namespace $namespace;
+
+use App\Http\Controllers\ApiController;
+use App\Modules\\$moduleStudly\Services\\$serviceName;
+use App\Modules\\$moduleStudly\Resources\\$resourceName;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+
+class $className extends ApiController
+{
+    protected $serviceName \$service;
+
+    public function __construct()
+    {
+        \$this->service = new $serviceName();
+    }
+
+    public function index(): JsonResponse
+    {
+        try {
+            \$items = \$this->service->getAll();
+            return \$this->respondWithResource(\$items);
+        } catch (\Exception \$e) {
+            return \$this->respondError(\$e->getMessage());
+        }
+    }
+
+    public function store(Request \$request): JsonResponse
+    {
+        try {
+            \$data = \$request->all();
+            \$item = \$this->service->create(\$data);
+            return \$this->respondCreated(\$item);
+        } catch (\Exception \$e) {
+            return \$this->respondError(\$e->getMessage());
+        }
+    }
+
+    public function show(\$id): JsonResponse
+    {
+        try {
+            \$item = \$this->service->findById(\$id);
+            return \$this->respondWithResource(\$item);
+        } catch (\Exception \$e) {
+            return \$this->respondError(\$e->getMessage());
+        }
+    }
+
+    public function update(Request \$request, \$id): JsonResponse
+    {
+        try {
+            \$this->service->update(\$id, \$request->all());
+            return \$this->respondSuccess();
+        } catch (\Exception \$e) {
+            return \$this->respondError(\$e->getMessage());
+        }
+    }
+
+    public function destroy(\$id): JsonResponse
+    {
+        try {
+            \$this->service->delete(\$id);
+            return \$this->respondSuccess();
+        } catch (\Exception \$e) {
+            return \$this->respondError(\$e->getMessage());
+        }
+    }
+}
+PHP;
+
+        File::put("$basePath/Controllers/$className.php", $content);
+    }
+
+
+    protected function moveModelToModule(string $model, string $module): void
+    {
+        $source = app_path("Models/{$model}.php");
+        $destination = app_path("Modules/{$module}/Models/{$model}.php");
+
+        if (!File::exists($source)) {
+            $this->error("Le modèle $model n'existe pas dans app/Models.");
+            return;
+        }
+
+        // Lire et modifier le contenu
+        $content = File::get($source);
+
+        // Met à jour le namespace
+        $newNamespace = "App\\Modules\\{$module}\\Models";
+        $content = preg_replace(
+            '/namespace\s+App\\\Models;/',
+            "namespace $newNamespace;",
+            $content
+        );
+
+        // Créer le dossier si pas encore existant
+        File::ensureDirectoryExists(dirname($destination));
+
+        // Sauver dans le module
+        File::put($destination, $content);
+
+        // Supprimer l'ancien fichier
+        File::delete($source);
+
+        $this->info("Modèle $model déplacé dans le module $module avec namespace mis à jour.");
+    }
+
+    protected function generateResource($basePath, $model, $columns, $moduleStudly): void
+    {
+        $className = "{$model}Resource";
+        $namespace = "App\\Modules\\$moduleStudly\\Resources";
+
+        $fields = implode(',' . PHP_EOL . '            ', array_map(fn($c) => "'$c' => \$this->$c", array_keys($columns)));
+
+        $content = <<<PHP
+<?php
+
+namespace $namespace;
+
+use Illuminate\Http\Resources\Json\JsonResource;
+
+class $className extends JsonResource
+{
+    /**
+     * Transform the resource into an array.
+     *
+     * @param  \Illuminate\Http\Request  \$request
+     * @return array
+     */
+    public function toArray(\$request): array
+    {
+        return [
+            'id' => \$this->id,
+            $fields,
+            'created_at' => \$this->created_at,
+            'updated_at' => \$this->updated_at,
+        ];
+    }
+}
+PHP;
+
+        File::put("$basePath/Resources/$className.php", $content);
+    }
+
+
+
+    protected function createModuleStructure($basePath): void
+    {
+        $folders = ['Controllers', 'Models', 'Services', 'Requests', 'Resources'];
+
+
+        foreach ($folders as $folder) {
+            File::ensureDirectoryExists("$basePath/$folder");
+        }
+    }
+
+    protected function extractColumnsFromMigration($model): array
+    {
+        $table = Str::snake(Str::pluralStudly($model));
+        $migrationPath = database_path('migrations');
+
+        $migrationFile = collect(File::allFiles($migrationPath))
+            ->first(fn($file) => str_contains($file->getFilename(), "create_{$table}_table"));
+
+        if (!$migrationFile) {
+            $this->error("Migration pour la table `$table` non trouvée.");
+            return [];
+        }
+
+        $content = File::get($migrationFile->getPathname());
+
+        preg_match_all("/->(\w+)\('(\w+)'/", $content, $matches);
+
+        $fields = array_combine($matches[2], $matches[1]);
+
+        // Ignorer les colonnes Laravel de base
+        return collect($fields)->reject(function ($type, $field) {
+            return in_array($field, ['id', 'created_at', 'updated_at']);
+        })->toArray();
+    }
+
+    protected function generateService($basePath, $model, $columns, $moduleStudly): void
+    {
+        $className = "{$model}Service";
+        $namespace = "App\\Modules\\" . $moduleStudly . "\\Services";
+
+        $args = implode(', ' . PHP_EOL . '            ', array_map(fn($c) => "'$c' => \$data['$c']", array_keys($columns)));
+        $modelResource = $model . 'Resource';
+
+        $content = <<<PHP
+<?php
+
+namespace $namespace;
+
+use App\\Modules\\$moduleStudly\\Models\\$model;
+use App\\Modules\\$moduleStudly\\Resources\\$modelResource;
+use Exception;
+use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
+
+class $className
+{
+    public function create(array \$data): $model
+    {
+        \$sqlModelCreate = $model::create([
+            $args
+        ]);
+
+        return new $model(\$sqlModelCreate);
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function update(string \$id, array \$data): $modelResource
+    {
+        \$model = $model::find(\$id);
+        if (! \$model) {
+            throw new Exception('error.not_found');
+        }
+
+        \$model->update([
+            $args
+        ]);
+
+        return new $modelResource(\$model);
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function delete(string \$id): bool
+    {
+        \$model = $model::find(\$id);
+        if (! \$model) {
+            throw new Exception('error.not_found');
+        }
+        return \$model->delete();
+    }
+
+    public function getAll(): AnonymousResourceCollection
+    {
+        \$allSqlModel = $model::all();
+        return $modelResource::collection(\$allSqlModel);
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function findById(\$id): ?$modelResource
+    {
+        \$modelSql =  $model::find(\$id);
+        if (! \$modelSql) {
+            throw new Exception('error.not_found');
+        };
+        return new $modelResource(\$modelSql);
+    }
+}
+PHP;
+
+        File::put("$basePath/Services/$className.php", $content);
+    }
+}
